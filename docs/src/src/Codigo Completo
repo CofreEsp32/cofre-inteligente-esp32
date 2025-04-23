@@ -1,0 +1,296 @@
+#include <ESP32Servo.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <SPIFFS.h>
+
+const byte ROWS = 4;
+const byte COLS = 4;
+byte rowPins[ROWS] = {16, 4, 2, 15};
+byte colPins[COLS] = {19, 18, 5, 17};
+const char keyMap[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+Servo servoMotor;
+Preferences preferences;
+const int servoPin = 22;
+const int buzzerPin = 14;
+const int posAberto = 90;
+const int posFechado = 0;
+int estadoServo;
+
+const char senhaCorreta[] = "1234";
+char senhaDigitada[10];
+byte senhaIndex = 0;
+
+int tentativasIncorretas = 0;
+unsigned long tempoBloqueio = 0;
+const int maxTentativas = 3;
+const unsigned long tempoBloqueioMs = 30000;
+unsigned long ultimoSegundoMostrado = 0;
+
+const char *ssid = "testecodigo";
+const char *password = "fivn0741";
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600);
+bool wifiConectado = false;
+
+const char senhaLog[] = "123A456B";
+
+void setup() {
+  Serial.begin(115200);
+  conectarWiFi();
+  if(wifiConectado) {
+    timeClient.begin();
+    timeClient.update();
+  }
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Falha ao iniciar SPIFFS");
+  }
+  iniciarSistema();
+}
+
+void conectarWiFi() {
+  Serial.print("Conectando ao Wi-Fi...");
+  WiFi.begin(ssid, password);
+  unsigned long inicioConexao = millis();
+  const unsigned long timeout = 20000;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if(millis() - inicioConexao > timeout) {
+      Serial.println("\nFalha na conexão WiFi! O sistema continuará sem WiFi.");
+      wifiConectado = false;
+      return;
+    }
+  }
+  Serial.println("\nConectado! IP: " + WiFi.localIP().toString());
+  wifiConectado = true;
+}
+
+void iniciarSistema() {
+  for (byte c = 0; c < COLS; c++) {
+    pinMode(colPins[c], INPUT_PULLUP);
+  }
+  if (!servoMotor.attached()) {
+    servoMotor.attach(servoPin);
+  }
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+  preferences.begin("servo", false);
+  estadoServo = posFechado;
+  servoMotor.write(estadoServo);
+  preferences.putInt("estado", estadoServo);
+  delay(1000);
+  Serial.println("\nDigite a senha:");
+  Serial.println("Pressione # para confirmar sua senha");
+  Serial.println("Pressione * para limpar sua senha ou FECHAR o cofre");
+}
+
+void loop() {
+  if (tentativasIncorretas >= maxTentativas) {
+    handleBloqueio();
+    return;
+  }
+  char tecla = lerTeclado();
+  if (tecla != 0) {
+    beepKey();
+    if (tecla == '#') {
+      verificarSenha();
+      limparSenha();
+    }  
+    else if (tecla == '*') {
+      fecharPorta();
+      limparSenha();
+      Serial.println("Digite a senha: ");
+    }  
+    else if (senhaIndex < sizeof(senhaDigitada) - 1) {
+      senhaDigitada[senhaIndex++] = tecla;
+      senhaDigitada[senhaIndex] = '\0';
+      if (strcmp(senhaDigitada, senhaLog) == 0) {
+        exibirEApagarLog();
+        reiniciarSistema();
+      }
+    }
+  }
+  delay(50);
+}
+
+void fecharPorta() {
+  estadoServo = posFechado;
+  servoMotor.write(estadoServo);
+  preferences.putInt("estado", estadoServo);
+  Serial.println("Cofre fechado!");
+  beepError();
+}
+
+void exibirEApagarLog() {
+  Serial.println("\n=== EXIBINDO REGISTRO DE TENTATIVAS DE SENHA ===");
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Erro ao acessar SPIFFS");
+    return;
+  }
+  File file = SPIFFS.open("/tentativas.txt", "r");
+  if (!file) {
+    Serial.println("Nenhum registro de senhas erradas encontrado!");
+    return;
+  }
+  while (file.available()) {
+    Serial.write(file.read());
+  }
+  file.close();
+  SPIFFS.remove("/tentativas.txt");
+  beepSuccess();
+}
+
+void reiniciarSistema() {
+  tentativasIncorretas = 0;
+  tempoBloqueio = 0;
+  limparSenha();
+  fecharPorta();
+  servoMotor.detach();
+  delay(100);
+  iniciarSistema();
+}
+
+void handleBloqueio() {
+  unsigned long tempoDecorrido = millis() - tempoBloqueio;
+  if (tempoDecorrido < tempoBloqueioMs) {
+    unsigned long segundosRestantes = (tempoBloqueioMs - tempoDecorrido) / 1000;
+    if (segundosRestantes != ultimoSegundoMostrado) {
+      Serial.print("Bloqueado. Tempo restante: ");
+      Serial.print(segundosRestantes);
+      Serial.println("s");
+      ultimoSegundoMostrado = segundosRestantes;
+      digitalWrite(buzzerPin, HIGH);
+      delay(50);
+      digitalWrite(buzzerPin, LOW);
+    }
+    delay(100);
+  } else {
+    tocarSireneDesbloqueio();
+    reiniciarSistema();
+  }
+}
+
+void tocarSirene() {
+  for (int i = 0; i < 8; i++) {
+    int freq = (i % 2 == 0) ? 800 : 1200;
+    tone(buzzerPin, freq, 150);
+    delay(150);
+    noTone(buzzerPin);
+    delay(50);
+  }
+  for (int j = 0; j < 3; j++) {
+    tone(buzzerPin, 1000, 300);
+    delay(400);
+    noTone(buzzerPin);
+    delay(100);
+  }
+}
+
+void tocarSireneDesbloqueio() {
+  for (int i = 0; i < 3; i++) {
+    tone(buzzerPin, 1000 + (i * 200), 100);
+    delay(150);
+  }
+  noTone(buzzerPin);
+}
+
+char lerTeclado() {
+  for (byte r = 0; r < ROWS; r++) {
+    pinMode(rowPins[r], OUTPUT);
+    digitalWrite(rowPins[r], LOW);
+    for (byte c = 0; c < COLS; c++) {
+      if (digitalRead(colPins[c]) == LOW) {
+        char tecla = keyMap[r][c];
+        while (digitalRead(colPins[c]) == LOW) delay(1);
+        pinMode(rowPins[r], INPUT_PULLUP);
+        return tecla;
+      }
+    }
+    pinMode(rowPins[r], INPUT_PULLUP);
+    delay(1);
+  }
+  return 0;
+}
+
+void verificarSenha() {
+  if (strcmp(senhaDigitada, senhaCorreta) == 0) {
+    beepSuccess();
+    Serial.println("Senha correta! Cofre aberto.");
+    tentativasIncorretas = 0;
+    estadoServo = posAberto;
+    servoMotor.write(estadoServo);
+    preferences.putInt("estado", estadoServo);
+  } else {
+    tentativasIncorretas++;
+    beepError();
+    registrarTentativaIncorreta();
+    Serial.print("Senha incorreta! Tentativas: ");
+    Serial.println(tentativasIncorretas);
+    if (tentativasIncorretas >= maxTentativas) {
+      tempoBloqueio = millis();
+      Serial.println("Sistema bloqueado por 30s!");
+      tocarSirene();
+      fecharPorta();
+    }
+  }
+}
+
+void registrarTentativaIncorreta() {
+  if (!wifiConectado) {
+    Serial.println("Tentativa não registrada (WiFi não disponível)");
+    return;
+  }
+  String dataHora = getDateTime();
+  String logEntry = "[" + dataHora + "] Senha incorreta: " + String(senhaDigitada) + "\n";
+  File file = SPIFFS.open("/tentativas.txt", FILE_APPEND);
+  if (file) {
+    file.print(logEntry);
+    file.close();
+  } else {
+    Serial.println("Falha ao abrir arquivo de log!");
+  }
+}
+
+String getDateTime() {
+  if (!wifiConectado) {
+    return "00/00/0000 00:00:00";
+  }
+  timeClient.update();
+  unsigned long epochTime = timeClient.getEpochTime();
+  struct tm *ptm = gmtime((time_t *)&epochTime);
+  char buffer[30];
+  sprintf(buffer, "%02d/%02d/%04d %02d:%02d:%02d",
+          ptm->tm_mday, ptm->tm_mon + 1, ptm->tm_year + 1900,
+          timeClient.getHours(), timeClient.getMinutes(), timeClient.getSeconds());
+  return String(buffer);
+}
+
+void limparSenha() {
+  senhaIndex = 0;
+  senhaDigitada[0] = '\0';
+}
+
+void beepSuccess() {
+  digitalWrite(buzzerPin, HIGH); delay(200);
+  digitalWrite(buzzerPin, LOW); delay(100);
+  digitalWrite(buzzerPin, HIGH); delay(200);
+  digitalWrite(buzzerPin, LOW);
+}
+
+void beepError() {
+  digitalWrite(buzzerPin, HIGH); delay(500);
+  digitalWrite(buzzerPin, LOW);
+}
+
+void beepKey() {
+  digitalWrite(buzzerPin, HIGH); delay(50);
+  digitalWrite(buzzerPin, LOW);
+}
